@@ -30,8 +30,20 @@ def cstate_to_pinput(controls: ControllerState) -> PlayerInput:
     )
 
 
+# TODO: Figure out why bot not moving after first spawn
+
+
 def distance(a, b):
     return sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
+
+
+def clip(value, lower, upper):
+    return lower if value < lower else upper if value > upper else value
+
+
+def norm_vec(x, y, scale):
+    mag = (x ** 2 + y ** 2 + 0.1) ** (0.5)
+    return x / mag * scale, y / mag * scale
 
 
 class ControlsTracker:
@@ -48,7 +60,7 @@ class ControlsTracker:
             self.target_controls = cstate_to_pinput(change.ControllerState())
 
     def run_socket_relay(self):
-        self.socket_man.connect_and_run(wants_quick_chat=False, wants_game_messages=True, wants_ball_predictions=False)
+        self.socket_man.connect_and_run(wants_quick_chat=True, wants_game_messages=True, wants_ball_predictions=False)
 
 
 class Replay:
@@ -70,7 +82,6 @@ class Replay:
         if index > self.current_index:
             self.current_index = index
             return snapshot
-
         return None
 
     def reset(self):
@@ -78,7 +89,7 @@ class Replay:
         self.finished = False
 
 
-class QuantumLeague:
+class AtkDef:
 
     def __init__(self, interface: GameInterface, packet: GameTickPacket):
         self.interface = interface
@@ -99,6 +110,18 @@ class QuantumLeague:
         self.attacker_touch_toggle = False
         self.initial_ball_coords = Vector3(0, 0, 0)
         self.is_back = False
+        self.is_retry = False
+        self.length_of_attack = 10  # (This doesnt do anything, just a temp value)
+        self.spawned_bot = False
+        self.playing_anim = False
+
+        # These initial values don't change anything
+        self.defend_car_data = [
+            Vector3(0, 5500, 0),  # Location
+            Rotator(0, pi, 0),  # Rotation
+            None,  # Velocity
+            100  # Boost amount
+        ]
 
     def restart_completely(self):
         self.attack_replays = []
@@ -206,20 +229,24 @@ class QuantumLeague:
             # Success when the defender touched the ball, and then some time has elapsed without goal
 
             if self.state == "defend":
+                self.spawned_bot = False
                 who_touched = packet.game_ball.latest_touch.player_name
 
-                # Let "You" touch ball, then when we touch back, then start emaasrue time
-                if who_touched == "You":
+                # Let bot touch ball, then when we touch back, then start emaasrue time
+                if who_touched != packet.game_cars[self.human_index].name:
                     self.time_measure = t
                     self.attacker_touch_toggle = True
 
                 # Success!
-                if who_touched != "You" and t - self.time_measure > 0.5 and self.attacker_touch_toggle:
+                if (who_touched == packet.game_cars[self.human_index].name
+                    and t - self.time_measure > 0.5 and self.attacker_touch_toggle) \
+                        or t > self.length_of_attack + 0.5:
                     self.time_measure = t
                     self.attacker_touch_toggle = False
                     self.show_text("Nice Block!", self.renderer.lime())
                     time.sleep(0.2)
                     self.prepare_next_stage()
+                    self.is_retry = False
                     return self.start_stage(packet)
 
                 # Fail, retry saving! (Need to figure out how to restart the bot replay or smth
@@ -227,7 +254,8 @@ class QuantumLeague:
                     self.time_measure = t
                     self.attacker_touch_toggle = False
                     self.fail_or_saved(custom_text="You missed! Try again", fail=True)
-                    self.last_reset_time = packet.game_info.seconds_elapsed
+                    self.last_reset_time = None
+                    self.is_retry = True
 
                     self.old_ball_replay.reset()
                     for replay in self.attack_replays + self.defend_replays:
@@ -237,11 +265,13 @@ class QuantumLeague:
 
         # next timeline
         if packet.teams[0].score > self.prev_blue_score:
+            self.spawned_bot = False
             self.time_measure = t
             self.attacker_touch_toggle = False
             # If score as attacker, become defender next stage
             if self.state == "attack":
                 self.prepare_next_stage()
+                self.length_of_attack = t
             else:
                 # If you own goal
                 self.fail_or_saved()
@@ -256,16 +286,18 @@ class QuantumLeague:
 
         if t > max_t:
             self.fail_or_saved()
+            self.spawned_bot = False
             return self.start_stage(packet)
 
         # reset button
         if t > self.initial_delay and keyboard.is_pressed("backspace"):
+            self.spawned_bot = False
             self.time_measure = t
             self.attacker_touch_toggle = False
             self.fail_or_saved(timeout=0.2)
             return self.start_stage(packet)
 
-        # Dont need practice mode anymore
+        # Dont need practice mode anymore ig
         # if keyboard.is_pressed("f1"):
         #     self.practice_mode = True
         #     self.show_text("Restarting in practice mode", self.renderer.lime())
@@ -282,43 +314,43 @@ class QuantumLeague:
         # info for attacking
         ball_location = packet.game_ball.physics.location
 
-        # car coords should be near the ball in some direciton, on the blue size, towards the center
-        x_coord_sign = abs(ball_location.x) / (ball_location.x + 0.1) + 0.1
-        # need to convert to vector 3 later
-        x_offset = x_coord_sign * random.randint(100, 1000)
-        # If ball is really back, better do a back wall dribble
-        y_offset = random.randint(500, 1000)
-        if self.is_back:
-            y_offset = - y_offset
-
-        # Rudimentray outofbounds prevention. Not really a big deal
-        if abs(ball_location.x - x_offset) > 4096:
-            x_offset *= 0.5
-        if abs(ball_location.y - y_offset) > 5120:
-            y_offset *= 0.5
-        car_loc = Vector3(
-            ball_location.x - x_offset,
-            ball_location.y - y_offset,
-            10
-        )
-
-        # Need to make the offset to euler angles?
-        # Ig its just 2d
-        # cars rotation should be such, that is almost facing the ball, but maybe som erandom offset
-        car_rot = Rotator(0, math.atan2(y_offset, x_offset) + random.randint(-30, 30) / 100, 0)
-
-        # Some initial speed, proportional to how far away from ball we spawned, But slower if ball is high
-        # 0.1 for preventing division by 0
-        car_vel = Vector3(
-            x_offset / (ball_location.z / 100 + 0.1),
-            y_offset / (ball_location.z / 100 + 0.1),
-            0
-        )
-
         if t < self.initial_delay:
-            time_to_spawn = self.initial_delay - t
-
             if self.state == "attack":
+
+                # car coords should be near the ball in some direciton, on the blue size, towards the center
+                x_coord_sign = abs(ball_location.x) / (ball_location.x + 0.1) + 0.1
+                # need to convert to vector 3 later
+                x_offset = x_coord_sign * random.randint(100, 1000)
+                # If ball is really back, better do a back wall dribble
+                y_offset = random.randint(600, 1400)
+                if self.is_back:
+                    y_offset *= 0.8
+                    y_offset = - y_offset
+
+                # Rudimentray outofbounds prevention. Not really a big deal
+                if abs(ball_location.x - x_offset) > 4096:
+                    x_offset *= 0.5
+                if abs(ball_location.y - y_offset) > 5120:
+                    y_offset *= 0.5
+                car_loc = Vector3(
+                    ball_location.x - x_offset,
+                    ball_location.y - y_offset,
+                    10
+                )
+
+                # Need to make the offset to euler angles?
+                # Ig its just 2d
+                # cars rotation should be such, that is almost facing the ball, but maybe som erandom offset
+                car_rot = Rotator(0, math.atan2(y_offset, x_offset) + random.randint(-30, 30) / 100, 0)
+
+                # Some initial speed, proportional to how far away from ball we spawned, But slower if ball is high
+                # 0.1 for preventing division by 0
+                car_vel = Vector3(
+                    x_offset * 0.9 / (ball_location.z / 80 + 0.1),
+                    y_offset * 0.9 / (ball_location.z / 80 + 0.1),
+                    0
+                )
+
                 target_game_state.cars[self.human_index] = CarState(
                     physics=Physics(
                         location=car_loc,
@@ -328,15 +360,89 @@ class QuantumLeague:
                     ),
                     boost_amount=100,
                 )
+
+                # Also predefine a place for defense
+                # For defensive, should spawn in different areas i think
+                # or maybe random, in a shadow position
+
+                # Position data
+                self.defend_car_data[0] = Vector3(
+                    clip(ball_location.x + random.randint(-3500, 3500), -4000, 4000),
+                    clip(ball_location.y + random.randint(2000, 4000), 0, 4000),
+                    5
+                )
+
+                # Either we are shadowing, or going aggressive against attacker
+                # Both are very distinct, so should have different set of rotations and vels
+                # Maybe a low boost scenario too
+                choices = ["Aggressive", "Shadow", "Low boost"]
+                got_choice = random.choice(choices)
+                if got_choice == choices[1]:
+                    # Shadow
+                    # Get a relative vec from car loc to closest corner of goal, that our angle
+                    # Goal_corners = [
+                    #     (-893,5120),
+                    #     (893,5120)
+                    # ]
+                    # The closest corner is decided by the sign on our x/horizontal coordinate
+                    rel_vec_x = math.copysign(893, self.defend_car_data[0].x) - self.defend_car_data[0].x
+                    rel_vec_y = 5120 - self.defend_car_data[0].y
+
+                    # Moving towards goal with some vel, so same vector, just scaled by some amount
+                    velocity_x = math.copysign(893, self.defend_car_data[0].x) - self.defend_car_data[0].x
+                    velocity_y = 5120 - self.defend_car_data[0].y
+
+                    # the farther away, make it move more slower
+                    velocity_x, velocity_y = norm_vec(velocity_x, velocity_y,
+                                                      8000000 / (velocity_x ** 2 + velocity_y ** 2 + 0.1) ** (0.5))
+
+                    boost_amt = 100
+
+                elif got_choice == choices[0]:
+                    # Aim at ball!
+                    rel_vec_x = self.initial_ball_coords.x - self.defend_car_data[0].x
+                    rel_vec_y = self.initial_ball_coords.y - self.defend_car_data[0].y
+
+                    # Aggression is risky, so slower
+                    velocity_x = self.initial_ball_coords.x - self.defend_car_data[0].x
+                    velocity_y = self.initial_ball_coords.y - self.defend_car_data[0].y
+
+                    velocity_x, velocity_y = norm_vec(velocity_x, velocity_y, 2000)
+
+                    boost_amt = 100
+
+                else:
+                    self.defend_car_data[0].y = 4000
+                    boost_amt = random.randint(5, 20)
+                    rel_vec_x = math.copysign(893, self.defend_car_data[0].x) - self.defend_car_data[0].x
+                    rel_vec_y = 5120 - self.defend_car_data[0].y
+
+                    # Moving towards goal with some vel, so same vector, just scaled by some amount
+                    velocity_x = math.copysign(893, self.defend_car_data[0].x) - self.defend_car_data[0].x
+                    velocity_y = 5120 - self.defend_car_data[0].y
+
+                    velocity_x, velocity_y = norm_vec(velocity_x, velocity_y, 1500)
+
+                gotten_angle = math.atan2(rel_vec_y, rel_vec_x)
+
+                # Undefined/Nan/inf check, default to -pi/2
+                if not (gotten_angle > 0 or gotten_angle < 0 or gotten_angle == 0):
+                    gotten_angle = -pi / 2
+
+                self.defend_car_data[1] = Rotator(0, gotten_angle, 0)
+                self.defend_car_data[2] = Vector3(velocity_x * 0.5, velocity_y * 0.5, 0)
+                self.defend_car_data[3] = boost_amt
+
             else:
                 target_game_state.cars[self.human_index] = CarState(
                     physics=Physics(
-                        location=Vector3(0, 4608, 18),
-                        rotation=Rotator(0, -0.5 * pi, 0),
-                        velocity=Vector3(0, 100, 0),
+                        #location=Vector3(0, 4608, 18),
+                        location=self.defend_car_data[0],
+                        rotation=self.defend_car_data[1],
+                        velocity=self.defend_car_data[2],
                         angular_velocity=Vector3(0, 0, 0),
                     ),
-                    boost_amount=100,
+                    boost_amount=self.defend_car_data[3],
                 )
 
         # record
@@ -345,9 +451,36 @@ class QuantumLeague:
         self.new_ball_replay.add_snapshot(t, snapshot.ball)
 
         # Let the unused bot just chill in the goal
+        # Maybe it should just slowly move towards the ball, to put pressure
         for index in self.blue_bots_indices + self.orange_bots_indices:
-            target_game_state.cars[index] = CarState(
-                Physics(Vector3(0, 5500, 0)))
+            if not self.playing_anim:
+                if not self.spawned_bot:
+                    target_game_state.cars[index] = CarState(
+                        Physics(
+                            location=self.defend_car_data[0], rotation=self.defend_car_data[1],
+                            velocity=self.defend_car_data[2]
+                        ))
+                    self.spawned_bot = True
+                self.interface.update_player_input(
+                    PlayerInput(
+                        throttle=1,
+                        steer=0,
+                        pitch=0,
+                        yaw=0,
+                        roll=0,
+                        jump=1,
+                        boost=1,
+                        handbrake=0,
+                        use_item=0,
+                    ),
+                    index
+                )
+            else:
+                target_game_state.cars[index] = CarState(
+                    Physics(
+                        location=self.defend_car_data[0], rotation=self.defend_car_data[1],
+                        velocity=self.defend_car_data[2]
+                    ))
 
         # playback cars
         for index, replay in itertools.chain(
@@ -355,18 +488,19 @@ class QuantumLeague:
                 zip(self.orange_bots_indices, reversed(self.defend_replays)),
         ):
             if replay.finished:
+                self.playing_anim = False
                 continue
 
             del target_game_state.cars[index]
 
             state = replay.playback(t)
             if state:
+                self.playing_anim = True
                 car_state, controls = state
 
                 # gets rid of the warning console spam
                 car_state.jumped = None
                 car_state.double_jumped = None
-
                 self.interface.update_player_input(controls, index)
                 target_game_state.cars[index] = car_state
 

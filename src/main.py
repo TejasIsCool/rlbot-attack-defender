@@ -8,7 +8,7 @@ from rlbot.matchconfig.match_config import PlayerConfig, MatchConfig, MutatorCon
 from rlbot.parsing.match_settings_config_parser import *
 from rlbot.setup_manager import SetupManager
 
-import quantum_league
+import attack_defender
 
 
 def human_config():
@@ -91,7 +91,7 @@ def build_match_config(game_map="Mannfield_Night", game_mode="Soccer", existing_
 
 class MinigameRunner(BaseScript):
     def __init__(self):
-        super().__init__("Quantum League")
+        super().__init__("Attack and Defend")
         self.setup_manager = SetupManager()
         self.setup_manager.game_interface = self.game_interface
 
@@ -116,9 +116,9 @@ class MinigameRunner(BaseScript):
             packet = self.wait_game_tick_packet()
             if packet.game_info.is_round_active:
                 break
-        self.minigame = quantum_league.QuantumLeague(self.game_interface, packet)
+        self.minigame = attack_defender.AtkDef(self.game_interface, packet)
 
-        self.minigame_file = Path(__file__).parent / "quantum_league.py"
+        self.minigame_file = Path(__file__).parent / "attack_defender.py"
         self.last_mtime = self.minigame_file.lstat().st_mtime
 
     def run(self):
@@ -129,8 +129,8 @@ class MinigameRunner(BaseScript):
             mtime = self.minigame_file.lstat().st_mtime
             if mtime > self.last_mtime:
                 try:
-                    importlib.reload(quantum_league)
-                    self.minigame = quantum_league.QuantumLeague(self.game_interface, packet)
+                    importlib.reload(attack_defender)
+                    self.minigame = attack_defender.AtkDef(self.game_interface, packet)
                     print(f"[{mtime}] Reloaded game")
                     self.last_mtime = mtime
 
