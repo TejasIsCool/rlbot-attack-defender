@@ -7,6 +7,8 @@ from typing import Optional
 import keyboard
 import random
 
+from utils import *
+
 from rlbot.messages.flat.ControllerState import ControllerState
 from rlbot.messages.flat.PlayerInputChange import PlayerInputChange
 from rlbot.socket.socket_manager import SocketRelay
@@ -24,82 +26,27 @@ Mode_Settings = {
     # Delay Settings
     'Initial Delay': 0.1,
     'Over Delay': 0.2,
-    'Time Limit': 50
+    'Time Limit': 120,
+
+    # Simple bot settings
+    # A very simple ball/player chasing bot, to put pressure
+    # Does not affect the attack replay
+    'Defense bot': True,
+    'Should boost': True,
+    'Should Jump': True,
+    'Aim at': 'Random'  # 'Random' or 'Player' or 'Ball'
 }
 
 
 # GL to anyone else trying to understand this whole code, cause i cant lol
+# It's a mess
 
+# Future ideas
 
-def cstate_to_pinput(controls: ControllerState) -> PlayerInput:
-    return PlayerInput(
-        throttle=controls.Throttle(),
-        steer=controls.Steer(),
-        pitch=controls.Pitch(),
-        yaw=controls.Yaw(),
-        roll=controls.Roll(),
-        jump=controls.Jump(),
-        boost=controls.Boost(),
-        handbrake=controls.Handbrake(),
-        use_item=controls.UseItem(),
-    )
-
-
-def distance(a, b):
-    return sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
-
-
-def clip(value, lower, upper):
-    return lower if value < lower else upper if value > upper else value
-
-
-def norm_vec(x, y, scale):
-    mag = (x ** 2 + y ** 2 + 0.1) ** (0.5)
-    return x / mag * scale, y / mag * scale
-
-
-class ControlsTracker:
-    def __init__(self, target_index) -> None:
-        self.target_controls = PlayerInput(0, 0, 0, 0, 0, False, False, False, False)
-        self.target_index = target_index
-        self.socket_man = SocketRelay()
-        self.socket_man.player_input_change_handlers.append(self.track_human_inputs)
-        self.socket_thread = threading.Thread(target=self.run_socket_relay)
-        self.socket_thread.start()
-
-    def track_human_inputs(self, change: PlayerInputChange, seconds: float, frame_num: int):
-        if change.PlayerIndex() == self.target_index:
-            self.target_controls = cstate_to_pinput(change.ControllerState())
-
-    def run_socket_relay(self):
-        self.socket_man.connect_and_run(wants_quick_chat=True, wants_game_messages=True, wants_ball_predictions=False)
-
-
-class Replay:
-    def __init__(self) -> None:
-        self.snapshots = []
-        self.current_index = 0
-        self.finished = False
-
-    def add_snapshot(self, t, snapshot):
-        self.snapshots.append((t, snapshot))
-
-    def playback(self, t: float) -> Optional[CarState]:
-        try:
-            index, snapshot = next(snapshot for snapshot in self.snapshots if snapshot[0] >= t)
-        except StopIteration:
-            self.finished = True
-            return None
-
-        if index > self.current_index:
-            self.current_index = index
-            return snapshot
-        return None
-
-    def reset(self):
-        self.current_index = 0
-        self.finished = False
-
+# Maybe retry previous defense?
+# Maybe retry previous offense?
+# Maybe offence+defence against the real bots?
+# Maybe loading training packs as initial setups, instead of random (idk how thatll be done)
 
 class AtkDef:
     def __init__(self, interface: GameInterface, packet: GameTickPacket):
@@ -121,24 +68,25 @@ class AtkDef:
         self.playing_anim = False
         self.store_defense = True
         self.store_offense = True
-
+        self.bot_attack_ball = True
 
         self.ball_data = [
-            Vector3(0,0,0),  # Location
-            Vector3(0,0,0),  # Velocity
+            Vector3(0, 0, 0),  # Location
+            Vector3(0, 0, 0),  # Velocity
         ]
 
         # These initial values don't change anything
         self.defend_car_data = [
             Vector3(0, 5500, 0),  # Location
-            Rotator(0, pi, 0),  # Rotation
-            Vector3(0,0,0),  # Velocity
+            Rotator(0, -pi / 2, 0),  # Rotation
+            Vector3(0, 0, 0),  # Velocity
             100  # Boost amount
         ]
         self.attack_car_data = [
             Vector3(0, -5500, 0),  # Location
-            Rotator(0, -pi, 0),  # Rotation
-            Vector3(0,0,0),  # Velocity
+            # 0 yaw: to the left from the blue side
+            Rotator(0, pi / 2, 0),  # Rotation
+            Vector3(0, 0, 0),  # Velocity
             100  # Always 100 tbf, can easily allow changing tho, tho i dont see a need. Maybe low boost offense?
         ]
 
@@ -189,7 +137,8 @@ class AtkDef:
                     random.randint(0, 400) if self.ball_data[0].z > 100 else 0
                 )
                 self.is_back = False
-                # If its very back(or maybe randomly), we want it to roll upwards ball, for full field air dribble practice
+                # If its very back(or maybe randomly), we want it to roll upwards ball,
+                # for full field air dribble practice
                 if self.ball_data[0].y < -4100 or (
                         self.ball_data[0].y < -3600 and random.choice([True, False])):
                     self.ball_data[0].z = 0
@@ -216,6 +165,7 @@ class AtkDef:
         time.sleep(0.1)
 
     def show_text(self, text, color):
+        self.renderer.clear_screen()
         self.renderer.begin_rendering()
         scale = 5
         for dx in [-3, 0, 3]:
@@ -272,6 +222,8 @@ class AtkDef:
                     self.show_text("Nice Block!", self.renderer.lime())
                     time.sleep(self.over_delay)
                     self.prepare_next_stage()
+                    self.store_offense = True
+                    self.store_defense = True
                     self.is_retry = False
                     return self.start_stage(packet)
 
@@ -303,13 +255,16 @@ class AtkDef:
             return self.start_stage(packet)
 
         if t > max_t:
+            self.store_offense = False
             self.fail_or_saved()
             self.spawned_bot = False
             return self.start_stage(packet)
 
         # reset button
         if t > self.initial_delay and keyboard.is_pressed(Mode_Settings['Reset Attack']):
+            self.store_offense = True
             self.spawned_bot = False
+            self.store_defense = True
             self.time_measure = t
             self.attacker_touch_toggle = False
             self.fail_or_saved(timeout=self.over_delay)
@@ -318,9 +273,6 @@ class AtkDef:
         # Retry offense
         # The defense position will be same
         # Maybe another keybind, to allow defense position to be different, but offense same?
-
-        # It works, kinda. But idk why there are still offsets when you press this
-        # But honestly, i dont mind it, its probably more fun with the little bit of offsets
         if t > self.initial_delay and keyboard.is_pressed(Mode_Settings['Retry Attack']):
             self.store_offense = False
             self.store_defense = False
@@ -343,23 +295,17 @@ class AtkDef:
 
         target_game_state = GameState(cars={})
 
-
-        # TODO: Maybe retry previous defense?
-        # TODO: Maybe retry previous offense?
-        # Might do in future
-
-
         # car drop
 
         # info for attacking
         ball_location = packet.game_ball.physics.location
 
-
         # This code block runs at start of each round ig
         if t < self.initial_delay:
             if self.state == "attack":
                 if self.store_offense:
-                    # car coords should be near the ball in some direciton, on the blue size, towards the center
+                    # car coords should be near the ball in some direction, on the blue size,
+                    # towards the center
                     x_coord_sign = abs(ball_location.x) / (ball_location.x + 0.1) + 0.1
                     # need to convert to vector 3 later
                     x_offset = x_coord_sign * random.randint(100, 1000)
@@ -369,7 +315,7 @@ class AtkDef:
                         y_offset *= 0.8
                         y_offset = - y_offset
 
-                    # Rudimentray outofbounds prevention. Not really a big deal
+                    # Rudimentary outofbounds prevention. Not really a big deal
                     if abs(ball_location.x - x_offset) > 4096:
                         x_offset *= 0.5
                     if abs(ball_location.y - y_offset) > 5120:
@@ -382,7 +328,8 @@ class AtkDef:
 
                     # Need to make the offset to euler angles?
                     # Ig its just 2d
-                    # cars rotation should be such, that is almost facing the ball, but maybe som erandom offset
+                    # cars rotation should be such, that is almost facing the ball,
+                    # but maybe some random offset
                     car_rot = Rotator(0, math.atan2(y_offset, x_offset) + random.randint(-30, 30) / 100, 0)
 
                     # Some initial speed, proportional to how far away from ball we spawned, But slower if ball is high
@@ -480,6 +427,14 @@ class AtkDef:
                     self.defend_car_data[2] = Vector3(velocity_x * 0.5, velocity_y * 0.5, 0)
                     self.defend_car_data[3] = boost_amt
 
+                    # What the bot should do in the stage
+                    if Mode_Settings['Aim at'] == "Random":
+                        self.bot_attack_ball = random.choice([True, False])
+                    elif Mode_Settings['Aim at'] == "Ball":
+                        self.bot_attack_ball = True
+                    else:
+                        self.bot_attack_ball = False
+
                     # To only allow changing location once
                     self.store_defense = False
 
@@ -496,16 +451,12 @@ class AtkDef:
                 )
                 self.store_defense = True
 
-        self.store_offense = True
-
-
         # record
         snapshot = GameState.create_from_gametickpacket(packet)
         self.current_replay.add_snapshot(t, (snapshot.cars[self.human_index], self.controls_tracker.target_controls))
         self.new_ball_replay.add_snapshot(t, snapshot.ball)
 
-        # Let the unused bot just chill in the goal
-        # Maybe it should just slowly move towards the ball, to put pressure
+        # Maybe bot should move towards the ball, to put pressure
         if not self.playing_anim:
             if not self.spawned_bot:
                 target_game_state.cars[self.bot_index] = CarState(
@@ -513,22 +464,60 @@ class AtkDef:
                         location=self.defend_car_data[0], rotation=self.defend_car_data[1],
                         velocity=self.defend_car_data[2]
                     ), boost_amount=self.defend_car_data[3])
-                self.spawned_bot = True
-                # TODO: Jump when close to ball, also aim at ball somehow
+            self.spawned_bot = True
+
+            if Mode_Settings['Defense bot']:
+
+                if self.bot_attack_ball:
+                    target = Vector(vec_3=packet.game_ball.physics.location)
+                    target_vel = Vector(vec_3=packet.game_ball.physics.velocity)
+                    updated_target = target + target_vel.scale(0.5)
+                else:
+                    target = Vector(vec_3=packet.game_cars[self.human_index].physics.location)
+                    target_vel = Vector(vec_3=packet.game_cars[self.human_index].physics.velocity)
+                    updated_target = target + target_vel.scale(0.5)
+
+                bot_coords = Vector(vec_3=packet.game_cars[self.bot_index].physics.location)
+                bot_orientation = packet.game_cars[self.bot_index].physics.rotation
+                rel_vec = bot_coords.rel_vec_with_axis(Orientation(bot_orientation), updated_target)
+                angle = math.atan2(rel_vec.y, rel_vec.x)
+                turn_angle = clip(angle, -1, 1)
+
+                xy_mag = rel_vec.xy_mag()
+
+                pitch = 1
+                jump = 0
+                if self.bot_attack_ball:
+                    if xy_mag < 800 and rel_vec.z > 100 and Mode_Settings['Should Jump']:
+                        jump = 1
+                else:
+                    if xy_mag < 800 and target.z > 30 and Mode_Settings['Should Jump']:
+                        jump = 1
+                        pitch = 0
+
+                boost = 0
+                if (xy_mag > 1600 or xy_mag < 1200) and Mode_Settings['Should boost']:
+                    boost = 1
+
+                handbrake = 0
+                if 1600 > xy_mag > 1200:
+                    handbrake = 1
+
                 self.interface.update_player_input(
                     PlayerInput(
                         throttle=1,
-                        steer=0,
-                        pitch=0,
-                        yaw=0,
+                        steer=turn_angle,
+                        pitch=pitch,
+                        yaw=turn_angle,
                         roll=0,
-                        jump=1,
-                        boost=1,
-                        handbrake=0,
+                        jump=jump,
+                        boost=boost,
+                        handbrake=handbrake,
                         use_item=0,
                     ),
                     self.bot_index
                 )
+
         # playback cars
         replay = self.attack_replay
         if replay.finished:
