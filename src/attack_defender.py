@@ -22,6 +22,7 @@ Mode_Settings = {
     'Reset Attack': 'backspace',
     'Retry Attack': '=',
     'Retry Attack But Change Defense': '-',
+    'Retry Defense': ']',
 
     # Delay Settings
     'Initial Delay': 0.1,
@@ -292,6 +293,19 @@ class AtkDef:
             self.fail_or_saved(timeout=self.over_delay)
             self.start_stage(packet)
             return
+
+        # Same as failing defense
+        if t > self.initial_delay and keyboard.is_pressed(Mode_Settings['Retry Defense']) and self.state == "defend":
+            self.time_measure = t
+            self.attacker_touch_toggle = False
+            self.fail_or_saved(custom_text="Retrying Defense!", timeout=0.1, fail=True)
+            self.last_reset_time = None
+            self.is_retry = True
+
+            self.old_ball_replay.reset()
+            self.attack_replay.reset()
+
+            return self.start_stage(packet, dont_restart=True)
 
         target_game_state = GameState(cars={})
 
